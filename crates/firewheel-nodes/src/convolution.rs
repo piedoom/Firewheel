@@ -7,7 +7,7 @@ use firewheel_core::{
     diff::{Diff, Patch},
     dsp::{
         buffer::ChannelBuffer,
-        declick::{DeclickFadeCurve, Declicker},
+        declick::{DeclickFadeCurve, Declicker, LowpassDeclicker},
         fade::FadeCurve,
         mix::{Mix, MixDSP},
         volume::Volume,
@@ -107,6 +107,7 @@ impl<const CHANNELS: usize> AudioNode for ConvolutionNode<CHANNELS> {
         });
 
         let block_frames = cx.stream_info.max_block_frames.get() as usize;
+        let sample_rate = cx.stream_info.sample_rate;
         ConvolutionProcessor::<CHANNELS> {
             params: self.clone(),
             // Response samples must be n-1 samples maximum to fit within the
@@ -116,16 +117,17 @@ impl<const CHANNELS: usize> AudioNode for ConvolutionNode<CHANNELS> {
                 self.mix,
                 self.fade_curve,
                 SmootherConfig::default(),
-                cx.stream_info.sample_rate,
+                sample_rate,
             ),
             input_buffers: ChannelBuffer::new(block_frames),
             wet_gain_smoothed: SmoothedParam::new(
                 self.wet_gain.amp(),
                 Default::default(),
-                cx.stream_info.sample_rate,
+                sample_rate,
             ),
             wet_gain_buffer: vec![0.0; block_frames],
             declick: Declicker::default(),
+            change_ir_declick: LowpassDeclicker::new(sample_rate, 0.2),
         }
     }
 }
@@ -140,6 +142,8 @@ struct ConvolutionProcessor<const CHANNELS: usize> {
     wet_gain_smoothed: SmoothedParam,
     wet_gain_buffer: Vec<f32>,
     declick: Declicker,
+    // Used to prevent crackling when changing impulse responses
+    change_ir_declick: LowpassDeclicker<CHANNELS>,
 }
 
 impl<const CHANNELS: usize> AudioNodeProcessor for ConvolutionProcessor<CHANNELS> {
@@ -152,6 +156,7 @@ impl<const CHANNELS: usize> AudioNodeProcessor for ConvolutionProcessor<CHANNELS
     ) -> ProcessStatus {
         // Determines if processing will pause next block
         let mut will_pause = false;
+        let mut ir_changed = false;
         for patch in events.drain_patches::<ConvolutionNode<CHANNELS>>() {
             match patch {
                 ConvolutionNodePatch::Mix(mix) => {
@@ -162,7 +167,8 @@ impl<const CHANNELS: usize> AudioNodeProcessor for ConvolutionProcessor<CHANNELS
                 }
                 ConvolutionNodePatch::ImpulseResponse(impulse_response) => {
                     self.params.impulse_response = impulse_response;
-
+                    // Mark the impulse response as being changed so we can declick
+                    ir_changed = true;
                     if let Some(impulse_response) = self.params.impulse_response.as_ref() {
                         // Initialize convolution buffers, depending on the
                         // count of channels in the currently loaded IR. There
@@ -274,6 +280,11 @@ impl<const CHANNELS: usize> AudioNodeProcessor for ConvolutionProcessor<CHANNELS
             1.0,
             DeclickFadeCurve::EqualPower3dB,
         );
+
+        if ir_changed {
+            self.change_ir_declick.begin();
+        }
+        self.change_ir_declick.process(buffers.outputs, info.frames);
 
         if will_pause {
             self.params.paused = true;
